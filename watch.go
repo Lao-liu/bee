@@ -16,8 +16,6 @@ package main
 
 import (
 	"bytes"
-	"fmt"
-	"github.com/howeyc/fsnotify"
 	"os"
 	"os/exec"
 	"regexp"
@@ -25,6 +23,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 var (
@@ -34,17 +34,17 @@ var (
 	scheduleTime time.Time
 )
 
+// NewWatcher starts an fsnotify Watcher on the specified paths
 func NewWatcher(paths []string, files []string, isgenerate bool) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		ColorLog("[ERRO] Fail to create new Watcher[ %s ]\n", err)
-		os.Exit(2)
+		logger.Fatalf("Failed to create watcher: %s", err)
 	}
 
 	go func() {
 		for {
 			select {
-			case e := <-watcher.Event:
+			case e := <-watcher.Events:
 				isbuild := true
 
 				// Skip ignored files
@@ -57,14 +57,14 @@ func NewWatcher(paths []string, files []string, isgenerate bool) {
 
 				mt := getFileModTime(e.Name)
 				if t := eventTime[e.Name]; mt == t {
-					ColorLog("[SKIP] # %s #\n", e.String())
+					logger.Infof(bold("Skipping: ")+"%s", e.String())
 					isbuild = false
 				}
 
 				eventTime[e.Name] = mt
 
 				if isbuild {
-					ColorLog("[EVEN] %s\n", e)
+					logger.Infof("Event fired: %s", e)
 					go func() {
 						// Wait 1s before autobuild util there is no file change.
 						scheduleTime = time.Now().Add(1 * time.Second)
@@ -76,51 +76,49 @@ func NewWatcher(paths []string, files []string, isgenerate bool) {
 							return
 						}
 
-						Autobuild(files, isgenerate)
+						AutoBuild(files, isgenerate)
 					}()
 				}
-			case err := <-watcher.Error:
-				ColorLog("[WARN] %s\n", err.Error()) // No need to exit here
+			case err := <-watcher.Errors:
+				logger.Warnf("Watcher error: %s", err.Error()) // No need to exit here
 			}
 		}
 	}()
 
-	ColorLog("[INFO] Initializing watcher...\n")
+	logger.Info("Initializing watcher...")
 	for _, path := range paths {
-		ColorLog("[TRAC] Directory( %s )\n", path)
-		err = watcher.Watch(path)
+		logger.Infof(bold("Watching: ")+"%s", path)
+		err = watcher.Add(path)
 		if err != nil {
-			ColorLog("[ERRO] Fail to watch directory[ %s ]\n", err)
-			os.Exit(2)
+			logger.Fatalf("Failed to watch directory: %s", err)
 		}
 	}
 
 }
 
-// getFileModTime retuens unix timestamp of `os.File.ModTime` by given path.
+// getFileModTime returns unix timestamp of `os.File.ModTime` for the given path.
 func getFileModTime(path string) int64 {
 	path = strings.Replace(path, "\\", "/", -1)
 	f, err := os.Open(path)
 	if err != nil {
-		ColorLog("[ERRO] Fail to open file[ %s ]\n", err)
+		logger.Errorf("Failed to open file on '%s': %s", path, err)
 		return time.Now().Unix()
 	}
 	defer f.Close()
 
 	fi, err := f.Stat()
 	if err != nil {
-		ColorLog("[ERRO] Fail to get file information[ %s ]\n", err)
+		logger.Errorf("Failed to get file stats: %s", err)
 		return time.Now().Unix()
 	}
 
 	return fi.ModTime().Unix()
 }
 
-func Autobuild(files []string, isgenerate bool) {
+// AutoBuild builds the specified set of files
+func AutoBuild(files []string, isgenerate bool) {
 	state.Lock()
 	defer state.Unlock()
-
-	ColorLog("[INFO] Start building...\n")
 
 	os.Chdir(currpath)
 
@@ -129,17 +127,27 @@ func Autobuild(files []string, isgenerate bool) {
 		cmdName = "gopm"
 	}
 
-	var err error
+	var (
+		err    error
+		stderr bytes.Buffer
+		stdout bytes.Buffer
+	)
 	// For applications use full import path like "github.com/.../.."
 	// are able to use "go install" to reduce build time.
-	if conf.GoInstall || conf.Gopm.Install {
+	if conf.GoInstall {
+		icmd := exec.Command(cmdName, "install", "-v")
+		icmd.Stdout = os.Stdout
+		icmd.Stderr = os.Stderr
+		icmd.Env = append(os.Environ(), "GOGC=off")
+		icmd.Run()
+	}
+	if conf.Gopm.Install {
 		icmd := exec.Command("go", "list", "./...")
-		buf := bytes.NewBuffer([]byte(""))
-		icmd.Stdout = buf
+		icmd.Stdout = &stdout
 		icmd.Env = append(os.Environ(), "GOGC=off")
 		err = icmd.Run()
 		if err == nil {
-			list := strings.Split(buf.String(), "\n")[1:]
+			list := strings.Split(stdout.String(), "\n")[1:]
 			for _, pkg := range list {
 				if len(pkg) == 0 {
 					continue
@@ -157,12 +165,15 @@ func Autobuild(files []string, isgenerate bool) {
 	}
 
 	if isgenerate {
+		logger.Info("Generating the docs...")
 		icmd := exec.Command("bee", "generate", "docs")
 		icmd.Env = append(os.Environ(), "GOGC=off")
-		icmd.Stdout = os.Stdout
-		icmd.Stderr = os.Stderr
-		icmd.Run()
-		ColorLog("============== generate docs ===================\n")
+		err = icmd.Run()
+		if err != nil {
+			logger.Errorf("Failed to generate the docs.")
+			return
+		}
+		logger.Success("Docs generated!")
 	}
 
 	if err == nil {
@@ -180,41 +191,43 @@ func Autobuild(files []string, isgenerate bool) {
 
 		bcmd := exec.Command(cmdName, args...)
 		bcmd.Env = append(os.Environ(), "GOGC=off")
-		bcmd.Stdout = os.Stdout
-		bcmd.Stderr = os.Stderr
+		bcmd.Stderr = &stderr
 		err = bcmd.Run()
+		if err != nil {
+			logger.Errorf("Failed to build the application: %s", stderr.String())
+			return
+		}
 	}
 
-	if err != nil {
-		ColorLog("[ERRO] ============== Build failed ===================\n")
-		return
-	}
-	ColorLog("[SUCC] Build was successful\n")
+	logger.Success("Built Successfully!")
 	Restart(appname)
 }
 
+// Kill kills the running command process
 func Kill() {
 	defer func() {
 		if e := recover(); e != nil {
-			fmt.Println("Kill.recover -> ", e)
+			logger.Infof("Kill recover: %s", e)
 		}
 	}()
 	if cmd != nil && cmd.Process != nil {
 		err := cmd.Process.Kill()
 		if err != nil {
-			fmt.Println("Kill -> ", err)
+			logger.Errorf("Error while killing cmd process: %s", err)
 		}
 	}
 }
 
+// Restart kills the running command process and starts it again
 func Restart(appname string) {
-	Debugf("kill running process")
+	logger.Debugf("Kill running process", __FILE__(), __LINE__())
 	Kill()
 	go Start(appname)
 }
 
+// Start starts the command process
 func Start(appname string) {
-	ColorLog("[INFO] Restarting %s ...\n", appname)
+	logger.Infof("Restarting '%s'...", appname)
 	if strings.Index(appname, "./") == -1 {
 		appname = "./" + appname
 	}
@@ -226,23 +239,22 @@ func Start(appname string) {
 	cmd.Env = append(os.Environ(), conf.Envs...)
 
 	go cmd.Run()
-	ColorLog("[INFO] %s is running...\n", appname)
+	logger.Successf("'%s' is running...", appname)
 	started <- true
 }
 
-// Should ignore filenames generated by
-// Emacs, Vim or SublimeText
+// shouldIgnoreFile ignores filenames generated by Emacs, Vim or SublimeText.
+// It returns true if the file should be ignored, false otherwise.
 func shouldIgnoreFile(filename string) bool {
 	for _, regex := range ignoredFilesRegExps {
 		r, err := regexp.Compile(regex)
 		if err != nil {
-			panic("Could not compile the regex: " + regex)
+			logger.Fatalf("Could not compile regular expression: %s", err)
 		}
 		if r.MatchString(filename) {
 			return true
-		} else {
-			continue
 		}
+		continue
 	}
 	return false
 }
